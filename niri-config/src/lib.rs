@@ -53,6 +53,8 @@ pub struct Config {
         )))
     ]
     pub screenshot_path: Option<String>,
+    #[knuffel(child, default = true)]
+    pub screenshot_notification: bool,
     #[knuffel(child, default)]
     pub clipboard: Clipboard,
     #[knuffel(child, default)]
@@ -4087,6 +4089,7 @@ mod tests {
             }
 
             screenshot-path "~/Screenshots/screenshot.png"
+            screenshot-notification false
 
             clipboard {
                 disable-primary
@@ -4639,6 +4642,7 @@ mod tests {
             screenshot_path: Some(
                 "~/Screenshots/screenshot.png",
             ),
+            screenshot_notification: false,
             clipboard: Clipboard {
                 disable_primary: true,
             },
