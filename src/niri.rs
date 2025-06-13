@@ -5479,7 +5479,7 @@ impl Niri {
             })
             .unwrap();
 
-        let show_notification = self.config.borrow().screenshot_notification;
+        let show_notification = !self.config.borrow().screenshot_notification_disable;
         // Encode and save the image in a thread as it's slow.
         thread::spawn(move || {
             let mut buf = vec![];
