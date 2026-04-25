@@ -67,7 +67,7 @@ use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
-use crate::render_helpers::{resources, shaders, RenderTarget};
+use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
@@ -97,9 +97,6 @@ pub struct Tty {
     dmabuf_global: Option<DmabufGlobal>,
     // The output config had changed, but the session is paused, so we need to update it on resume.
     update_output_config_on_resume: bool,
-    // The ignored nodes have changed, but the session is paused, so we need to update it on
-    // resume.
-    update_ignored_nodes_on_resume: bool,
     // Whether the debug tinting is enabled.
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
@@ -434,11 +431,20 @@ impl Tty {
             .unwrap();
 
         let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
+        unsafe { init_libinput_plugin_system(&libinput) };
         {
             let _span = tracy_client::span!("Libinput::udev_assign_seat");
             libinput.udev_assign_seat(&seat_name)
         }
         .map_err(|()| anyhow!("error assigning the seat to libinput"))?;
+
+        // If the session is not active at startup (e.g. niri was launched from a different TTY),
+        // suspend libinput now so that when ActivateSession fires, libinput.resume() performs a
+        // full re-enumeration of input devices instead of being a no-op.
+        if !session.is_active() {
+            debug!("session is not active, starting libinput in paused state");
+            libinput.suspend();
+        }
 
         let input_backend = LibinputInputBackend::new(libinput.clone());
         event_loop
@@ -486,11 +492,6 @@ impl Tty {
         }
         info!("using as the render node: {node_path}");
 
-        let mut ignored_nodes = ignored_nodes_from_config(&config.borrow());
-        if ignored_nodes.remove(&primary_node) || ignored_nodes.remove(&primary_render_node) {
-            warn!("ignoring the primary node or render node is not allowed");
-        }
-
         Ok(Self {
             config,
             session,
@@ -499,17 +500,27 @@ impl Tty {
             gpu_manager,
             primary_node,
             primary_render_node,
-            ignored_nodes,
+            ignored_nodes: HashSet::new(),
             devices: HashMap::new(),
             dmabuf_global: None,
             update_output_config_on_resume: false,
-            update_ignored_nodes_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
+        // If the session is inactive, skip initialization because we won't be able to do much with
+        // the devices anyway. We'll get ActivateSession and add the devices there instead.
+        //
+        // This can happen when starting niri while having a different TTY active (e.g. via tmux).
+        if !self.session.is_active() {
+            return;
+        }
+
+        // Initialize the ignored nodes.
+        self.ignored_nodes = self.compute_ignored_nodes();
+
         let udev = self.udev_dispatcher.clone();
         let udev = udev.as_source_ref();
 
@@ -548,6 +559,10 @@ impl Tty {
                     debug!("skipping UdevEvent::Added as session is inactive");
                     return;
                 }
+
+                // Recompute ignored nodes to resolve symlinks (like /dev/dri/by-path/...) to their
+                // new underlying device IDs.
+                self.ignored_nodes = self.compute_ignored_nodes();
 
                 if let Err(err) = self.device_added(device_id, &path, niri) {
                     warn!("error adding device: {err:?}");
@@ -596,16 +611,9 @@ impl Tty {
                     warn!("error resuming libinput");
                 }
 
-                if self.update_ignored_nodes_on_resume {
-                    self.update_ignored_nodes_on_resume = false;
-                    let mut ignored_nodes = ignored_nodes_from_config(&self.config.borrow());
-                    if ignored_nodes.remove(&self.primary_node)
-                        || ignored_nodes.remove(&self.primary_render_node)
-                    {
-                        warn!("ignoring the primary node or render node is not allowed");
-                    }
-                    self.ignored_nodes = ignored_nodes;
-                }
+                // While the session was suspended, GPUs could have been added, so
+                // /dev/dri/by-path/... symlinks need to be re-resolved.
+                self.ignored_nodes = self.compute_ignored_nodes();
 
                 let mut device_list = self
                     .udev_dispatcher
@@ -646,7 +654,16 @@ impl Tty {
 
                     // It hasn't been removed, update its state as usual.
                     let device = self.devices.get_mut(&node).unwrap();
-                    if let Err(err) = device.drm.activate(false) {
+
+                    // Someone on an old device hit what seems to be a driver bug without this:
+                    // https://github.com/niri-wm/niri/issues/3048
+                    let force_disable = self
+                        .config
+                        .borrow()
+                        .debug
+                        .force_disable_connectors_on_resume;
+
+                    if let Err(err) = device.drm.activate(force_disable) {
                         warn!("error activating DRM device: {err:?}");
                     }
                     if let Some(lease_state) = &mut device.drm_lease_state {
@@ -689,7 +706,14 @@ impl Tty {
                 }
 
                 // Add new devices.
-                for (device_id, path) in device_list.into_iter() {
+                //
+                // Add the primary node first as later nodes might depend on the primary render
+                // node being available.
+                let primary_device_id = self.primary_node.dev_id();
+                let primary_device_path = device_list.remove(&primary_device_id);
+                let primary = primary_device_path.map(|path| (primary_device_id, path));
+
+                for (device_id, path) in primary.into_iter().chain(device_list) {
                     if let Err(err) = self.device_added(device_id, &path, niri) {
                         warn!("error adding device: {err:?}");
                     }
@@ -799,7 +823,10 @@ impl Tty {
                 .context("error creating renderer")?;
 
             if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
-                warn!("error binding wl-display in EGL: {err:?}");
+                // wl_drm is on its way out so this is expected on most modern distros.
+                trace!("error binding legacy EGL to wl_display: {err}");
+            } else {
+                debug!("bound legacy EGL to wl_display");
             }
 
             let gles_renderer = renderer.as_gles_renderer();
@@ -969,6 +996,32 @@ impl Tty {
                 } => {
                     removed.push(crtc);
                 }
+                // Emitted when the list of connector modes changes at runtime.
+                //
+                // Some devices, notably USB-C docks with DP-MST/alt-mode, report Connected before
+                // the EDID has been read, with an empty mode list. Then, at a later point, the
+                // modes will be populated, at which point we'll get this Changed event.
+                DrmScanEvent::Changed {
+                    connector,
+                    crtc: Some(crtc),
+                } => {
+                    let connector_name = format_connector_name(&connector);
+                    let name = make_output_name(&device.drm, connector.handle(), connector_name);
+                    debug!(
+                        "connector changed: {} \"{}\"",
+                        &name.connector,
+                        name.format_make_model_serial(),
+                    );
+
+                    if !device.known_crtcs.contains_key(&crtc) {
+                        // I guess this can happen if the connector initially wasn't mapped to a
+                        // CRTC but then got mapped before being changed.
+                        warn!("changed connector missing from known crtcs");
+                    }
+
+                    // We don't actually need to do anything here; on_output_config_changed() will
+                    // take care of picking a new mode if needed.
+                }
                 _ => (),
             }
         }
@@ -1055,6 +1108,7 @@ impl Tty {
                 if let Err(err) = surface.compositor.reset_state() {
                     warn!("error resetting DrmCompositor state: {err:?}");
                 }
+                surface.compositor.reset_buffers();
             }
         }
 
@@ -1382,7 +1436,7 @@ impl Tty {
 
         // Create the compositor.
         let res = DrmCompositor::new(
-            OutputModeSource::Auto(output.clone()),
+            OutputModeSource::Auto(output.downgrade()),
             surface,
             None,
             device.allocator.clone(),
@@ -1412,7 +1466,7 @@ impl Tty {
                     .create_surface(crtc, mode, &[connector.handle()])?;
 
                 DrmCompositor::new(
-                    OutputModeSource::Auto(output.clone()),
+                    OutputModeSource::Auto(output.downgrade()),
                     surface,
                     None,
                     device.allocator.clone(),
@@ -1666,8 +1720,8 @@ impl Tty {
                 // This is an error!() because it shouldn't happen, but on some systems it somehow
                 // does. Kernel sending rogue vblank events?
                 //
-                // https://github.com/YaLTeR/niri/issues/556
-                // https://github.com/YaLTeR/niri/issues/615
+                // https://github.com/niri-wm/niri/issues/556
+                // https://github.com/niri-wm/niri/issues/615
                 error!(
                     "unexpected redraw state for output {name} (should be WaitingForVBlank); \
                      can happen when resuming from sleep or powering on monitors: {state:?}"
@@ -1828,8 +1882,12 @@ impl Tty {
         };
 
         // Render the elements.
-        let mut elements =
-            niri.render::<TtyRenderer>(&mut renderer, output, true, RenderTarget::Output);
+        let ctx = RenderCtx {
+            renderer: &mut renderer,
+            target: RenderTarget::Output,
+            xray: None,
+        };
+        let mut elements = niri.render_to_vec(ctx, output, true);
 
         // Visualize the damage, if enabled.
         if niri.debug_draw_damage {
@@ -2225,22 +2283,25 @@ impl Tty {
         }
     }
 
-    pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
-        let _span = tracy_client::span!("Tty::update_ignored_nodes_config");
-
-        // If we're inactive, we can't do anything, so just set a flag for later.
-        if !self.session.is_active() {
-            self.update_ignored_nodes_on_resume = true;
-            return;
-        }
-
+    fn compute_ignored_nodes(&self) -> HashSet<DrmNode> {
         let mut ignored_nodes = ignored_nodes_from_config(&self.config.borrow());
         if ignored_nodes.remove(&self.primary_node)
             || ignored_nodes.remove(&self.primary_render_node)
         {
             warn!("ignoring the primary node or render node is not allowed");
         }
+        ignored_nodes
+    }
 
+    pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
+        let _span = tracy_client::span!("Tty::update_ignored_nodes_config");
+
+        // If we're inactive, we can't do anything, but we'll recompute in ActivateSession.
+        if !self.session.is_active() {
+            return;
+        }
+
+        let ignored_nodes = self.compute_ignored_nodes();
         if ignored_nodes == self.ignored_nodes {
             return;
         }
@@ -3324,6 +3385,50 @@ fn make_output_name(
     }
 }
 
+/// Initializes the libinput plugin system.
+///
+/// # Safety
+///
+/// This function must be called before libinput iterates through the devices, i.e. before
+/// libinput_udev_assign_seat() or the first call to libinput_path_add_device().
+unsafe fn init_libinput_plugin_system(libinput: &Libinput) {
+    #[cfg(have_libinput_plugin_system)]
+    unsafe {
+        use std::ffi::{c_char, c_int, CString};
+        use std::os::unix::ffi::OsStringExt;
+
+        use directories::BaseDirs;
+        use input::ffi::libinput;
+        use input::AsRaw as _;
+
+        extern "C" {
+            fn libinput_plugin_system_append_path(libinput: *const libinput, path: *const c_char);
+            fn libinput_plugin_system_append_default_paths(libinput: *const libinput);
+            fn libinput_plugin_system_load_plugins(
+                libinput: *const libinput,
+                flags: c_int,
+            ) -> c_int;
+        }
+        const LIBINPUT_PLUGIN_SYSTEM_FLAG_NONE: c_int = 0;
+        let libinput = libinput.as_raw();
+
+        // Also load plugins from $XDG_CONFIG_HOME/libinput/plugins.
+        if let Some(dirs) = BaseDirs::new() {
+            let mut plugins_dir = dirs.config_dir().to_path_buf();
+            plugins_dir.push("libinput");
+            plugins_dir.push("plugins");
+            if let Ok(plugins_dir) = CString::new(plugins_dir.into_os_string().into_vec()) {
+                libinput_plugin_system_append_path(libinput, plugins_dir.as_ptr());
+            }
+        }
+
+        libinput_plugin_system_append_default_paths(libinput);
+        libinput_plugin_system_load_plugins(libinput, LIBINPUT_PLUGIN_SYSTEM_FLAG_NONE);
+    }
+    #[cfg(not(have_libinput_plugin_system))]
+    let _ = libinput;
+}
+
 #[cfg(test)]
 mod tests {
     use insta::assert_debug_snapshot;
@@ -3347,30 +3452,32 @@ mod tests {
             hsync_polarity: HSyncPolarity::NHSync,
             vsync_polarity: VSyncPolarity::PVSync,
         };
-        assert_debug_snapshot!(calculate_drm_mode_from_modeline(&modeline1).unwrap(), @"Mode {
-    name: \"1920x1080@59.96\",
-    clock: 173000,
-    size: (
-        1920,
-        1080,
-    ),
-    hsync: (
-        2048,
-        2248,
-        2576,
-    ),
-    vsync: (
-        1083,
-        1088,
-        1120,
-    ),
-    hskew: 0,
-    vscan: 0,
-    vrefresh: 60,
-    mode_type: ModeTypeFlags(
-        USERDEF,
-    ),
-}");
+        assert_debug_snapshot!(calculate_drm_mode_from_modeline(&modeline1).unwrap(), @r#"
+        Mode {
+            name: "1920x1080@59.96",
+            clock: 173000,
+            size: (
+                1920,
+                1080,
+            ),
+            hsync: (
+                2048,
+                2248,
+                2576,
+            ),
+            vsync: (
+                1083,
+                1088,
+                1120,
+            ),
+            hskew: 0,
+            vscan: 0,
+            vrefresh: 60,
+            mode_type: ModeTypeFlags(
+                USERDEF,
+            ),
+        }
+        "#);
         let modeline2 = Modeline {
             clock: 452.5,
             hdisplay: 1920,
@@ -3384,82 +3491,88 @@ mod tests {
             hsync_polarity: HSyncPolarity::NHSync,
             vsync_polarity: VSyncPolarity::PVSync,
         };
-        assert_debug_snapshot!(calculate_drm_mode_from_modeline(&modeline2).unwrap(), @"Mode {
-    name: \"1920x1080@143.88\",
-    clock: 452500,
-    size: (
-        1920,
-        1080,
-    ),
-    hsync: (
-        2088,
-        2296,
-        2672,
-    ),
-    vsync: (
-        1083,
-        1088,
-        1177,
-    ),
-    hskew: 0,
-    vscan: 0,
-    vrefresh: 144,
-    mode_type: ModeTypeFlags(
-        USERDEF,
-    ),
-}");
+        assert_debug_snapshot!(calculate_drm_mode_from_modeline(&modeline2).unwrap(), @r#"
+        Mode {
+            name: "1920x1080@143.88",
+            clock: 452500,
+            size: (
+                1920,
+                1080,
+            ),
+            hsync: (
+                2088,
+                2296,
+                2672,
+            ),
+            vsync: (
+                1083,
+                1088,
+                1177,
+            ),
+            hskew: 0,
+            vscan: 0,
+            vrefresh: 144,
+            mode_type: ModeTypeFlags(
+                USERDEF,
+            ),
+        }
+        "#);
     }
 
     #[test]
     fn test_calc_cvt() {
         // Crosschecked with other calculators like the cvt commandline utility.
-        assert_debug_snapshot!(calculate_mode_cvt(1920, 1080, 60.0), @"Mode {
-    name: \"1920x1080@59.96\",
-    clock: 173000,
-    size: (
-        1920,
-        1080,
-    ),
-    hsync: (
-        2048,
-        2248,
-        2576,
-    ),
-    vsync: (
-        1083,
-        1088,
-        1120,
-    ),
-    hskew: 0,
-    vscan: 0,
-    vrefresh: 60,
-    mode_type: ModeTypeFlags(
-        USERDEF,
-    ),
-}");
-        assert_debug_snapshot!(calculate_mode_cvt(1920, 1080, 144.0), @"Mode {
-    name: \"1920x1080@143.88\",
-    clock: 452500,
-    size: (
-        1920,
-        1080,
-    ),
-    hsync: (
-        2088,
-        2296,
-        2672,
-    ),
-    vsync: (
-        1083,
-        1088,
-        1177,
-    ),
-    hskew: 0,
-    vscan: 0,
-    vrefresh: 144,
-    mode_type: ModeTypeFlags(
-        USERDEF,
-    ),
-}");
+        assert_debug_snapshot!(calculate_mode_cvt(1920, 1080, 60.0), @r#"
+        Mode {
+            name: "1920x1080@59.96",
+            clock: 173000,
+            size: (
+                1920,
+                1080,
+            ),
+            hsync: (
+                2048,
+                2248,
+                2576,
+            ),
+            vsync: (
+                1083,
+                1088,
+                1120,
+            ),
+            hskew: 0,
+            vscan: 0,
+            vrefresh: 60,
+            mode_type: ModeTypeFlags(
+                USERDEF,
+            ),
+        }
+        "#);
+        assert_debug_snapshot!(calculate_mode_cvt(1920, 1080, 144.0), @r#"
+        Mode {
+            name: "1920x1080@143.88",
+            clock: 452500,
+            size: (
+                1920,
+                1080,
+            ),
+            hsync: (
+                2088,
+                2296,
+                2672,
+            ),
+            vsync: (
+                1083,
+                1088,
+                1177,
+            ),
+            hskew: 0,
+            vscan: 0,
+            vrefresh: 144,
+            mode_type: ModeTypeFlags(
+                USERDEF,
+            ),
+        }
+        "#);
     }
 }
